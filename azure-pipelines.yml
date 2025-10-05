@@ -1,0 +1,97 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  imageName: 'flask'
+  tag: '$(Build.BuildId)'
+
+stages:
+  - stage: Infra
+    displayName: Terraform Apply
+    jobs:
+      - job: TerraformApply
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: 'Terraform Init & Apply'
+            inputs:
+              azureSubscription: '<<YOUR-AZURE-DEVOPS-SERVICE-CONNECTION-NAME>>'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                cd terraform
+                terraform init
+                terraform apply -auto-approve
+
+  - stage: Build_and_Push
+    displayName: Build and Push Docker image to ACR
+    dependsOn: Infra
+    jobs:
+      - job: Build
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: Docker@2
+            displayName: Build and Push
+            inputs:
+              containerRegistry: '<<YOUR-ACR-SERVICE-CONNECTION>>'
+              repository: '$(imageName)'
+              command: 'buildAndPush'
+              Dockerfile: 'app/Dockerfile'
+              tags: |
+                $(tag)
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: 'k8s'
+              artifact: 'k8s'
+
+  - stage: Deploy
+    displayName: Deploy to AKS
+    dependsOn: Build_and_Push
+    jobs:
+      - deployment: DeployToAKS
+        environment: 'aks-demo'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: k8s
+                - task: AzureCLI@2
+                  displayName: 'Get AKS credentials'
+                  inputs:
+                    azureSubscription: '<<YOUR-AZURE-DEVOPS-SERVICE-CONNECTION-NAME>>'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az aks get-credentials --resource-group $(resourceGroup) --name $(AKS_NAME) --overwrite-existing
+                - task: Bash@3
+                  displayName: 'Replace image and kubectl apply'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      IMAGE=$(ACR_LOGIN_SERVER)/$(imageName):$(tag)
+                      echo "Deploying $IMAGE"
+                      sed -i "s|REPLACE_WITH_IMAGE|$IMAGE|g" k8s/deployment.yaml
+                      kubectl apply -f k8s/namespace.yaml
+                      kubectl apply -f k8s/deployment.yaml
+                      kubectl apply -f k8s/service.yaml
+                - task: AzureCLI@2
+                  displayName: "Install Prometheus & Grafana via Helm"
+                  inputs:
+                    azureSubscription: '<<YOUR-AZURE-SERVICE-CONNECTION-NAME>>'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az aks get-credentials --resource-group $(resourceGroup) --name $(AKS_NAME) --overwrite-existing
+                      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                      helm repo add grafana https://grafana.github.io/helm-charts
+                      helm repo update
+                      helm upgrade --install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace --values terraform/prom-values.yaml
